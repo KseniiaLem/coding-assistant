@@ -32,9 +32,10 @@ _agent = build_agent()
 # conversation_id -> {"title", "time", "history", "display"}
 _conversations: dict[str, dict] = {}
 
-# conversation_id -> the in-flight agent.run() task, so /chat/{cid}/stop
-# can cancel it while the client's original /chat request is still open.
-_running: dict[str, asyncio.Task] = {}
+# conversation_id -> {"task": in-flight agent.run() task, "events": the
+# live event list it's writing to}. /chat/{cid}/stop cancels the task;
+# /chat/{cid}/events reads the list mid-run so the browser can poll it.
+_running: dict[str, dict] = {}
 
 _PLAN_NOTE = (
     "(Planning mode is ON: explore the project and present a design. "
@@ -135,7 +136,9 @@ async def chat(req: ChatRequest) -> dict:
     task = asyncio.ensure_future(
         _agent.run(message, message_history=conv["history"], deps=deps)
     )
-    _running[cid] = task
+    # deps.events is the exact list the hook appends to live, so storing
+    # a reference here (not a copy) lets /chat/{cid}/events see it grow.
+    _running[cid] = {"task": task, "events": deps.events}
 
     try:
         result = await task
@@ -178,11 +181,21 @@ async def chat(req: ChatRequest) -> dict:
 @app.post("/chat/{cid}/stop")
 async def stop_chat(cid: str) -> dict:
     """Cancel the in-flight request of a conversation, if any."""
-    task = _running.get(cid)
+    entry = _running.get(cid)
+    task = entry["task"] if entry else None
     if task is not None and not task.done():
         task.cancel()
         return {"stopped": True}
     return {"stopped": False}
+
+
+@app.get("/chat/{cid}/events")
+async def chat_events(cid: str) -> dict:
+    """Return the activity-log lines written so far by an in-flight
+    request, so the browser can poll for live progress instead of
+    waiting for the whole reply to finish."""
+    entry = _running.get(cid)
+    return {"events": list(entry["events"]) if entry else []}
 
 
 _PAGE = """<!doctype html>
@@ -527,6 +540,17 @@ async function send(event) {
   box.value = '';
   addMsg('user', text);
   const waiting = addMsg('bot', '<i>thinking&hellip;</i>');
+
+  // Poll for activity-log lines while the reply is still generating,
+  // instead of only seeing them once the whole request finishes.
+  let shown = 0;
+  const poll = setInterval(async function () {
+    const r = await fetch('/chat/' + cid + '/events');
+    const data = await r.json();
+    for (let i = shown; i < data.events.length; i++) addLog(data.events[i]);
+    shown = data.events.length;
+  }, 400);
+
   try {
     const r = await fetch('/chat', {
       method: 'POST',
@@ -544,11 +568,13 @@ async function send(event) {
     currentId = data.conversation_id;
     waiting.innerHTML = render(data.reply);
     if (data.usage) addMeta(data.usage);
-    (data.events || []).forEach(addLog);
+    // Only the tail: events up to "shown" were already drawn by polling.
+    (data.events || []).slice(shown).forEach(addLog);
     refreshConvs();
   } catch (e) {
     waiting.textContent = 'Connection error: ' + e;
   }
+  clearInterval(poll);
   sending = false;
   btn.textContent = 'Send';
   box.focus();
